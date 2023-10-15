@@ -1,75 +1,119 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
 
+import os
+import re
 import math
 import ctypes
 import torch
 import torch.nn as nn
+from tqdm import tqdm
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import TensorDataset,DataLoader
 from torchtext.datasets import WikiText2
 from torchtext.data.utils import get_tokenizer
 from torchtext.vocab import build_vocab_from_iterator
-from torch.nn.utils.rnn import pad_sequence
+
+from models import *
 
 torch.manual_seed(2023)
 
-train_iter = WikiText2(split='train')
-for i in train_iter:
-    print(i)
-tokenizer = get_tokenizer('basic_english')
-vocab = build_vocab_from_iterator(map(tokenizer, train_iter), specials=['<unk>'])
+padlen = 2048
+languages = {'human':0,'bash':83,'clojure':16,'cpp':21,'csharp':23,'css':24,
+             'fsharp':36,'go':39,'java':48,'js':49,'php':68,
+             'powershell':70,'python':73,'ruby':78,'scala':81,'sql':86,
+             'xml':98}
+languages2 = {j:i for i,(j,k) in enumerate(languages.items())}
+languages3 = {languages2[i]:languages[i] for i in languages}
+
+log(languages2,languages3)
+
+def load_data(dir='./data/train'):
+    l = []
+    for lang in os.listdir(dir):
+        langidx = languages2[lang]
+        langdir = os.path.join(dir,lang)
+        for i,file in enumerate(os.listdir(langdir)):
+            if i>50:
+                break
+            file = os.path.join(langdir,file)
+            with open(file,'r') as f:
+                code = f.read().strip()
+            code = re.sub(r'[^\x00-\x7F]+','<unk>',code)
+            if len(code)<padlen:
+                l.append((langidx,code))
+            else:
+                l += [(langidx,code[i:i+padlen]) for i in range(0,len(code),padlen)]
+    return l
+
+trainiter = load_data()
+tokenizer = get_tokenizer("revtok")
+#tokenizer = lambda x: x.split()
+vocab = build_vocab_from_iterator(map(tokenizer,(j for i,j in trainiter)), specials=['<pad>','<unk>'], max_tokens=1000)
 vocab.set_default_index(vocab['<unk>'])
 
+log(vocab.get_itos())
 
-class TransformerModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.model_type = 'Transformer'
-        self.ntoken_src = 128
-        self.ntoken_tgt = 100 # number of different programming languages
-        self.d_model = 512
+def data_process(textiter):
+    data = [torch.tensor(vocab(tokenizer(j)), dtype=torch.long) for i,j in textiter]
+    data = pad_sequence(data,batch_first=True,padding_value=vocab['<pad>'])
+    log('data shape: %s'%(data.shape,))
+    data = TensorDataset(data, torch.tensor([i for i,j in textiter],dtype=torch.long))
+    data = DataLoader(dataset=data,batch_size=16,shuffle=True,drop_last=True)
+    return data
 
-        self.src_encoder = nn.Embedding(self.ntoken_src, self.d_model)
-        self.pos_encoder = PositionalEncoding(self.d_model)
-        # batch_first (bool) – If True, then the input and output tensors are provided as (batch, seq, feature)
-        self.transformer = nn.TransformerEncoderLayer(d_model=self.d_model, nhead=8, batch_first=True)
-        self.generator   = nn.Linear(self.d_model, self.ntoken_tgt)
+traindata = data_process(trainiter)
 
-    def forward(self,src):
-        src = torch.rand(32, 10, 512)
-        # src = self.src_encoder(src) * math.sqrt(self.d_model)
-        # src = self.pos_encoder(src)
-        out = self.transformer(src)
-        return self.generator(out)
+assert vocab['<pad>']==0, 'because this 0 is hardcoded in models.py'
+model = TransformerModel(len(vocab),len(languages))
 
-class PositionalEncoding(nn.Module):
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
 
-    def __init__(self, d_model: int, max_len: int = 4096):
-        super().__init__()
+def train(epoch=-1):
+    model.train()
+    accloss = []
+    for code,target in tqdm(traindata):
+        output  = model(code)
+        loss    = criterion(output, target)
+        accloss.append(loss.item())
 
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, 1, d_model)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
+    optimizer.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+    optimizer.step()
 
-    def forward(self, x):
-        """
-        Args:
-            x: Tensor, shape [seq_len, batch_size, embedding_dim]
-        """
-        x = x + self.pe[:x.size(0)]
-        return x
+    accloss = torch.tensor(accloss)
+    log("epoch %3d, loss %.4f"%(epoch,accloss.mean().item()))
+
+def train_epochs():
+    for epoch in range(5):
+        train(epoch)
+
+    export_model()
 
 def export_model(save_name='detect_model.pt'):
-    model = TransformerModel()
-    print(model.forward(None).shape)
+    # torch.save(tokenizer, 'tokenizer.pt')
+    # torch.save(vocab, 'vocab.pt')
     model_scripted = torch.jit.script(model) # Export to TorchScript
     model_scripted.save(save_name) # Save
-    print("saved to %s"%(save_name))
+    log("saved to %s"%(save_name))
+
+def detect(text: str) -> int:
+    print(text)
+    text = torch.tensor(vocab(tokenizer(text))).unsqueeze(0)
+    print(text)
+    lang = model(text).squeeze()
+    print(lang)
+    _,lang = torch.max(lang,dim=-1)
+    return languages3[lang.item()]
+
+def pre_process(text: str) -> int:
+    return torch.tensor(vocab(tokenizer(text))).unsqueeze(0)
 
 if __name__=="__main__":
-    #export_model()
-    # TglangLanguage = ctypes.CDLL('./tglang.h')
-    # print(TglangLanguage.TGLANG_LANGUAGE_PYTHON)
-    pass
+    torch.save(pre_process,'pre_process.pt')
+    #train_epochs()
+    #print(detect("print(torch.max(lang,dim=-1))"))
+    # detect_func = torch.jit.script(tokenizer)
+    # detect_func.save("tokenizer.pt")
